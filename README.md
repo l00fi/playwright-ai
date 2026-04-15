@@ -1,0 +1,1 @@
+![- u usig quicksort or bublesort? - i using ai...](photo_5393239383789475322_x.jpg)
