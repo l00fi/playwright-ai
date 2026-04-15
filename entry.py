@@ -12,9 +12,58 @@ class BrowserEnv:
             args=["--disable-blink-features=AutomationControlled"] # Немного прячемся от антифрода
         )
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        self._install_single_tab_guards()
+        self._ensure_single_tab()
+
+    def _install_single_tab_guards(self):
+        """Гарантирует работу только в одной вкладке."""
+        self.context.on("page", self._on_new_page)
+
+    def _on_new_page(self, new_page):
+        """Перенаправляет неожиданные новые вкладки в основную и закрывает их."""
+        if new_page == self.page:
+            return
+
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=2500)
+        except Exception:
+            pass
+
+        target_url = ""
+        try:
+            target_url = new_page.url
+        except Exception:
+            pass
+
+        # about:blank не несет полезной навигации — просто закрываем.
+        if target_url and target_url != "about:blank":
+            try:
+                self.page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+
+        try:
+            new_page.close()
+        except Exception:
+            pass
+
+        self._ensure_single_tab()
+
+    def _ensure_single_tab(self):
+        """Оставляет только self.page активной вкладкой в контексте."""
+        pages = list(self.context.pages)
+        if self.page not in pages and pages:
+            self.page = pages[0]
+        for p in list(self.context.pages):
+            if p != self.page:
+                try:
+                    p.close()
+                except Exception:
+                    pass
 
     def go_to(self, url: str):
         """Переход по URL с мягким ожиданием"""
+        self._ensure_single_tab()
         try:
             # Ждем просто загрузки основного контента (load)
             self.page.goto(url, wait_until="load", timeout=20000)
@@ -23,35 +72,29 @@ class BrowserEnv:
 
     def parse_page(self):
         """
-        МАГИЯ ЗДЕСЬ: JS-скрипт, который находит все интерактивные элементы,
-        присваивает им кастомный атрибут data-ai-id и возвращает компактный список.
-        Это решает проблему токенов и избавляет от хардкода селекторов!
+        Собираем компактное текстовое состояние по уже размеченным data-ai-id.
+        Важно не перезаписывать ID после отрисовки, чтобы текст и скриншот совпадали.
         """
         js_script = """
         () => {
-            let ai_id = 1;
-            let interactable =[];
-            // Ищем ссылки, кнопки, инпуты и элементы с ролью button
-            let elements = document.querySelectorAll('a, button, input, textarea, [role="button"]');
-            
-            elements.forEach(el => {
+            const interactable = [];
+            const marked = Array.from(document.querySelectorAll('[data-ai-id]'))
+                .sort((a, b) => Number(a.getAttribute('data-ai-id')) - Number(b.getAttribute('data-ai-id')));
+
+            for (const el of marked) {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
-                
-                // Берем только видимые элементы
-                if(rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none') {
-                    el.setAttribute('data-ai-id', ai_id);
-                    
-                    // Пытаемся достать осмысленный текст элемента
-                    let text = el.innerText || el.placeholder || el.value || el.getAttribute('aria-label') || 'No text';
-                    text = text.trim().substring(0, 60).replace(/\\n/g, ' '); // Режем длинные тексты
-                    
-                    if (text !== 'No text' && text !== '') {
-                        interactable.push(`[ID: ${ai_id}] ${el.tagName.toLowerCase()} - '${text}'`);
-                        ai_id++;
-                    }
+                if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') {
+                    continue;
                 }
-            });
+
+                const id = el.getAttribute('data-ai-id');
+                let text = el.innerText || el.placeholder || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                text = text.trim().substring(0, 80).replace(/\\n/g, ' ');
+                if (!text) text = 'No text';
+                interactable.push(`[ID: ${id}] ${el.tagName.toLowerCase()} - '${text}'`);
+            }
+
             return interactable.join('\\n');
         }
         """
@@ -63,9 +106,13 @@ class BrowserEnv:
         """
         Улучшенная отрисовка меток и захват скриншота.
         """
-        # Сначала даем странице "продышаться" после предыдущего действия
-        time.sleep(2) 
-        
+        # Короткое "успокоение" DOM после прошлого действия.
+        self.page.wait_for_timeout(300)
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=2500)
+        except Exception:
+            pass
+
         draw_script = """
         () => {
             // 1. Удаляем все старые метки и обводки
@@ -112,12 +159,15 @@ class BrowserEnv:
                     ai_id++;
                 }
             });
+            return ai_id - 1;
         }
         """
         try:
             self.page.evaluate(draw_script)
-            # Короткая пауза, чтобы браузер успел отрисовать красные квадраты
-            time.sleep(0.8) 
+            # Даем браузеру 2 кадра на финальную отрисовку оверлеев.
+            self.page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+            )
             
             screenshot_path = "screenshot.png"
             self.page.screenshot(path=screenshot_path)
@@ -128,11 +178,45 @@ class BrowserEnv:
         except Exception as e:
             return None, f"Ошибка визуализации: {str(e)}"
 
+    def is_dangerous_element(self, element_id: int):
+        """Пытается распознать потенциально деструктивный клик по тексту элемента."""
+        selector = f'[data-ai-id="{element_id}"]'
+        js_script = """
+        (sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return { exists: false, dangerous: false, text: "" };
+            const raw = (
+                el.innerText ||
+                el.value ||
+                el.getAttribute('aria-label') ||
+                el.getAttribute('title') ||
+                ""
+            ).toLowerCase().trim();
+            const dangerWords = [
+                "delete", "remove", "trash", "spam", "send", "submit", "unsubscribe",
+                "удал", "спам", "отправ", "очист", "подтверд", "подпис"
+            ];
+            const dangerous = dangerWords.some(word => raw.includes(word));
+            return { exists: true, dangerous, text: raw };
+        }
+        """
+        try:
+            result = self.page.evaluate(js_script, selector)
+            if not result.get("exists", False):
+                return False, "Элемент не найден"
+            if result.get("dangerous", False):
+                return True, f"Обнаружен рискованный текст элемента: '{result.get('text', '')[:120]}'"
+            return False, ""
+        except Exception as e:
+            return False, f"Не удалось проверить элемент: {str(e)}"
+
     def click_element(self, element_id: int):
         """Кликает по элементу и не падает от фоновых запросов"""
+        self._ensure_single_tab()
         selector = f'[data-ai-id="{element_id}"]'
         try:
             self.page.locator(selector).click(timeout=5000)
+            self._ensure_single_tab()
             # Вместо networkidle ждем просто загрузки DOM
             self.page.wait_for_load_state("domcontentloaded", timeout=5000)
             time.sleep(2) # Даем 2 секунды на случайную анимацию
