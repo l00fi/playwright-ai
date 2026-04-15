@@ -4,10 +4,16 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, To
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
+# from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
+import base64
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Импортируем наш браузер
 from entry import BrowserEnv
+import prompts
 
 # Инициализируем браузер (делаем глобальным, чтобы инструменты имели к нему доступ)
 env = BrowserEnv(headless=False)
@@ -17,21 +23,15 @@ env = BrowserEnv(headless=False)
 # ==========================================
 
 @tool
-def get_page_state() -> str:
-    """Возвращает список интерактивных элементов на странице в формате [ID] тип - 'Текст'.
-    ОБЯЗАТЕЛЬНО вызывай этот инструмент после КАЖДОГО перехода или клика, чтобы увидеть новые элементы!"""
-    return env.parse_page()
-
-@tool
 def navigate(url: str) -> str:
     """Переходит по указанному URL."""
     env.go_to(url)
-    return f"Успешно перешли на {url}. Теперь вызови get_page_state(), чтобы осмотреться."
+    # ИСПРАВЛЕНО: Убрали упоминание get_page_state
+    return f"Успешно перешли на {url}. Твое зрение обновлено, анализируй новую страницу."
 
 @tool
 def click(element_id: int) -> str:
-    """Кликает по элементу с указанным ID. 
-    Используй для БЕЗОПАСНЫХ действий (чтение писем, навигация, открытие меню)."""
+    """Кликает по элементу с указанным ID."""
     return env.click_element(element_id)
 
 @tool
@@ -41,35 +41,35 @@ def type_text(element_id: int, text: str) -> str:
 
 @tool
 def press_enter() -> str:
-    """Нажимает клавишу Enter (полезно после ввода текста)."""
+    """Нажимает клавишу Enter."""
     env.page.keyboard.press("Enter")
-    env.page.wait_for_load_state("networkidle")
-    return "Клавиша Enter нажата."
+    try:
+        env.page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except:
+        pass
+    time.sleep(2)
+    return "Клавиша Enter нажата. Страница обновлена."
 
 @tool
 def dangerous_action(element_id: int, action_description: str) -> str:
-    """ИСПОЛЬЗУЙ ТОЛЬКО ДЛЯ ДЕСТРУКТИВНЫХ ДЕЙСТВИЙ (удаление писем, спам, отправка, оплата).
-    Сначала запрашивает разрешение у пользователя через терминал.
-    В action_description кратко опиши, что ты хочешь сделать (например: 'Удалить спам-письмо от XXX')."""
-    
-    # --- SECURITY LAYER ИЗ ТРЕБОВАНИЙ ТЕСТОВОГО ---
+    """ИСПОЛЬЗУЙ ТОЛЬКО ДЛЯ ДЕСТРУКТИВНЫХ ДЕЙСТВИЙ (удаление, спам, отправка).
+    Запрашивает подтверждение у пользователя."""
     print(f"\n[SECURITY ALERT] Агент планирует ОПАСНОЕ ДЕЙСТВИЕ:")
     print(f"👉 Цель: {action_description}")
     user_input = input("Разрешить выполнение? [y/n]: ")
     
     if user_input.lower() == 'y':
         result = env.click_element(element_id)
-        return f"Пользователь РАЗРЕШИЛ действие. Результат клика: {result}"
+        return f"Пользователь РАЗРЕШИЛ действие. Результат: {result}"
     else:
-        return "Пользователь ЗАПРЕТИЛ действие. Не нажимай на эту кнопку, найди другой путь или пропусти письмо."
+        return "Пользователь ОТМЕНИЛ действие. Тебе нужно найти другой путь или пропустить это."
 
 @tool
 def finish_task(report: str) -> str:
-    """Вызови этот инструмент, когда задача полностью выполнена.
-    Передай в report итоговый отчет для пользователя."""
+    """Вызывается, когда задача полностью выполнена."""
     return f"Задача завершена. Отчет: {report}"
 
-tools =[get_page_state, navigate, click, type_text, press_enter, dangerous_action, finish_task]
+tools =[navigate, click, type_text, press_enter, dangerous_action, finish_task]
 
 # ==========================================
 # 2. СБОРКА LANGGRAPH
@@ -80,28 +80,46 @@ class AgentState(TypedDict):
 
 # Инициализируем LLM (gpt-4o отлично работает с Tools, но можно и claude-3-5-sonnet-20240620)
 
-# llm = ChatOpenAI(model="gpt-4o", temperature=0)
-# llm_with_tools = llm.bind_tools(tools)
-
-llm = ChatOllama(model="qwen2.5", temperature=0)
+llm = ChatOpenAI(
+    model="openai/gpt-4o",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+    base_url="https://openrouter.ai/api/v1",
+    temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 
-system_prompt = """Ты автономный AI-веб-агент. Твоя задача - управлять браузером и выполнять поручения пользователя.
-ПРАВИЛА:
-1. Ты НЕ видишь страницу автоматически. Чтобы понять, что на экране, ТЫ ОБЯЗАН СНАЧАЛА ВЫЗВАТЬ get_page_state().
-2. Получив список элементов с их ID, ты можешь вызывать click(), type_text() и т.д.
-3. После каждого действия (клик, ввод, переход) DOM-дерево меняется! ОБЯЗАТЕЛЬНО вызывай get_page_state() снова, чтобы получить новые ID элементов.
-4. Если нужно удалить письмо или нажать кнопку "Спам" — ОБЯЗАТЕЛЬНО используй dangerous_action() вместо обычного click().
-5. Рассуждай шаг за шагом. Не пытайся сделать всё за один вызов.
-6. Когда выполнишь всю задачу, вызови finish_task(твое резюме)."""
-
 def agent_node(state: AgentState):
+    # 1. Получаем свежий скриншот
+    screenshot_path, text_metadata = env.get_visual_state()
+    
+    if not screenshot_path:
+        return {"messages": [AIMessage(content="Я не вижу страницу. Попробую еще раз.")]}
+
+    with open(screenshot_path, "rb") as image_file:
+        base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+
+    # 2. Берем историю (без старых картинок!)
     messages = state["messages"]
-    # Подсовываем системный промпт, если его еще нет
+    
     if not any(isinstance(m, SystemMessage) for m in messages):
-        messages = [SystemMessage(content=system_prompt)] + messages
-        
-    response = llm_with_tools.invoke(messages)
+        messages = [SystemMessage(content=prompts.SYSTEM_PROMPT)] + messages
+
+    # 3. Формируем ОДИН HumanMessage с текущим зрением
+    # Мы не добавляем его в state навсегда, а используем только для текущего вызова invoke
+    current_perception = HumanMessage(content=[
+        {
+            "type": "text", 
+            "text": f"CURRENT PAGE CONTENT:\n{text_metadata}\n\nAnalyze the screenshot and text. What is your single next step to reach the goal?"
+        },
+        {
+            "type": "image_url", 
+            "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+        }
+    ])
+
+    # Вызов модели: история + свежий взгляд
+    response = llm_with_tools.invoke(messages + [current_perception])
+    
+    # ВАЖНО: в State возвращаем только текстовый ответ модели, чтобы не раздувать граф
     return {"messages": [response]}
 
 def tool_node(state: AgentState):
@@ -147,6 +165,9 @@ if __name__ == "__main__":
     print("="*50)
     print("🚀 Автономный Web-Агент запущен!")
     print("="*50)
+
+    print("🌐 Открываем стартовую страницу...")
+    env.go_to("https://ya.ru")
     
     user_task = input("\n📝 Введите задачу для агента: ")
     

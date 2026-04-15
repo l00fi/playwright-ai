@@ -1,2 +1,4 @@
 browser_data
 playwright-ai
+*.png
+.env
