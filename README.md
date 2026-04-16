@@ -1,98 +1,98 @@
-![- u using quicksort or bublesort? - i using ai...](materials/ai.jpg)
+## Что это за проект
 
-[Test task](https://vlrdev.craft.me/ai_test_task/b/8B8AEE1D-3A86-4E9D-915C-1944B12B021B/%E2%9C%89%EF%B8%8F-%D0%A3%D0%B4%D0%B0%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5-%D1%81%D0%BF%D0%B0%D0%BC%D0%B0)
+Это автономный веб-агент на `Playwright + LangGraph + LLM`, который решает пользовательскую задачу пошагово:
+- декомпозирует цель на подзадачи,
+- выполняет по одному действию за шаг,
+- проверяет прогресс критиком,
+- умеет восстанавливаться после сбоев, циклов и «ухода не туда».
 
-## Run
+Ключевой фокус решения — не просто «кликать», а **контролируемо доводить задачу до результата** с прозрачными логами и диагностикой.
+
+## Ключевые решения
+
+- **Двухролевая модель управления:** `Critic` отвечает за план/контроль, `Executor` — за точечные действия.
+- **Устойчивость к нестабильному UI:** рестарты подзадач, детект повторов, реплан при застревании.
+- **Безопасность операций:** потенциально рискованные клики блокируются через отдельный путь `dangerous_action`.
+- **Мультимодальная проверка:** критик оценивает и текстовое состояние страницы, и скриншот текущего шага.
+- **Навигационная память:** агент ведет карту пройденного пути (`navigation_trace`) и использует ее для возврата в правильный контекст.
+- **Наблюдаемость “из коробки”:** подробные `jsonl`-логи, таймлайн и итоговая статистика по времени/инструментам.
+
+## Быстрый старт
 
 ```bash
 python main.py
 ```
 
-## Current architecture
+Перед запуском настройте переменные окружения (см. раздел ниже).
 
-- `main.py` - single entrypoint.
-- `src/agent_core.py` - runtime orchestration with two roles:
-  - `Critic`: builds plan, tracks progress, detects loops/offtrack, controls restarts.
-  - `Executor`: chooses and calls one browser tool per step.
-- `src/agent_tools.py` - tool definitions for LLM.
-- `src/entry.py` - browser wrapper (single-tab guard, SoM labels, screenshot + page text state).
-- `src/prompts.py` - system prompt.
+## Архитектура
 
-## Execution model (Critic + Executor)
+- `main.py` — точка входа.
+- `src/agent_core.py` — оркестрация рантайма (LangGraph state machine, `Critic`, `Executor`).
+- `src/entry.py` — браузерное окружение (single-tab guard, оверлеи элементов, скриншот + текстовое состояние).
+- `src/agent_tools.py` — инструменты, доступные исполнителю (`navigate`, `click`, `type_text`, `press_enter`, `dangerous_action`).
+- `src/prompts.py` — все системные/пользовательские промпты для planner/replan/critic/executor/extract.
+- `src/run_logger.py` — отдельный логгер рантайма и итоговой статистики.
 
-1. Critic builds a sequence of subtasks from the user goal.
-2. Each subtask is executed step-by-step by Executor.
-3. After every tool call page state is refreshed via `get_visual_state()`.
-4. Critic evaluates progress and can restart current subtask on loop/offtrack.
-5. If all subtasks are done -> final `SUCCESS` report.
-6. If limits are exceeded -> final `BLOCKED` report with reason.
+## Модель выполнения
 
-## LangGraph node map
+1. `Critic` строит план из 4-8 подзадач.
+2. `Executor` на каждом шаге выбирает **ровно один** инструмент.
+3. После действия снимается новое состояние страницы (скрин + структурированный текст).
+4. `Critic` оценивает текущую подзадачу (`done/progress/stuck/offtrack`).
+5. При проблемах рантайм перезапускает подзадачу или делает реплан.
+6. На выходе формируется `SUCCESS` или `BLOCKED` с подробным отчетом.
 
-Runtime in `src/agent_core.py` is implemented as a LangGraph state machine:
+## Граф узлов (LangGraph)
 
-- `init`
-  - Reads user goal.
-  - Critic creates initial subtask plan.
-  - Initializes counters and runtime state.
-- `subtask_setup`
-  - Starts current subtask context.
-  - Resets per-subtask counters/signatures/recent actions.
-- `guard`
-  - Enforces hard limits (`total_steps`, `steps_per_subtask`, `restarts_per_subtask`).
-  - Decides whether to continue, restart subtask, or block run.
-- `snapshot`
-  - Captures current page state via `env.get_visual_state()`.
-  - Routes back to `guard` if snapshot fails (retries); after too many failures in a row, run is `BLOCKED` and `finalize` runs.
-- `executor_decide`
-  - Executor selects exactly one tool call for current subtask.
-  - Routes back to `guard` on invalid/no tool-call.
-- `executor_execute`
-  - Executes selected tool.
-  - Logs tool result and refreshes post-action snapshot.
-  - Appends action/signature history into graph state.
-- `critic_evaluate`
-  - Critic checks loop signal and subtask progress (`done/progress/stuck/offtrack`).
-  - Decides: continue current subtask, restart, move to next subtask, or block/succeed.
-- `finalize`
-  - Builds final report (`SUCCESS`/`BLOCKED`) and writes run-end logs.
-
-### Main routing flow
+Основной поток:
 
 `init -> subtask_setup -> guard -> snapshot -> executor_decide -> executor_execute -> critic_evaluate`
 
-Then conditional transitions:
+Ветвления:
+- `critic_evaluate -> guard` (продолжить подзадачу),
+- `critic_evaluate -> subtask_setup` (следующая подзадача),
+- `critic_evaluate -> replan` (перестроить план),
+- `critic_evaluate -> finalize` (успех/блокировка),
+- `guard -> finalize` (лимиты/жесткий стоп).
 
-- `critic_evaluate -> guard` (continue current subtask)
-- `critic_evaluate -> subtask_setup` (next subtask)
-- `critic_evaluate -> finalize` (success/block)
-- `guard -> finalize` (hard-stop condition)
+## Логирование и аналитика
 
-## .env keys used by current runtime
+Для каждого запуска создается директория в `artifacts/runs/<run_id>/`:
+- `events.jsonl` — поток всех событий рантайма,
+- `timeline.md` — человекочитаемая хронология.
 
-Required:
+В финальном событии `run_finished` дополнительно пишутся:
+- **полный маршрут агента** (`agent_route`),
+- **карта контрольных точек** (`navigation_trace`),
+- **время выполнения** (`elapsed_seconds`),
+- **статистика инструментов** (`tool_call_counts`).
 
+Это позволяет быстро анализировать стабильность, узкие места и стоимость шага.
+
+## Переменные окружения
+
+Обязательные:
 - `OPENROUTER_API_KEY`
-- `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`)
-- `AGENT_MODEL` (default `openai/gpt-4o`)
+- `OPENROUTER_BASE_URL` (по умолчанию `https://openrouter.ai/api/v1`)
+- `AGENT_MODEL` (по умолчанию `openai/gpt-4o`)
 
-Runtime limits:
+Лимиты рантайма:
+- `AGENT_MAX_TOTAL_STEPS`
+- `AGENT_MAX_STEPS_PER_SUBTASK`
+- `AGENT_MAX_RESTARTS_PER_SUBTASK`
+- `AGENT_LOOP_REPEAT_THRESHOLD`
+- `AGENT_LANGGRAPH_RECURSION_LIMIT` (по умолчанию `200`)
+- `AGENT_MAX_SNAPSHOT_FAIL_STREAK` (по умолчанию `5`)
+- `AGENT_MAX_REPLANS`
 
-- `AGENT_MAX_TOTAL_STEPS` - hard cap for all actions in one run.
-- `AGENT_MAX_STEPS_PER_SUBTASK` - max actions before subtask restart.
-- `AGENT_MAX_RESTARTS_PER_SUBTASK` - max restart attempts per subtask.
-- `AGENT_LOOP_REPEAT_THRESHOLD` - repeated identical action threshold for loop detection.
-- `AGENT_LANGGRAPH_RECURSION_LIMIT` - LangGraph `recursion_limit` (default `200`) to avoid `GraphRecursionError` on long runs.
-- `AGENT_MAX_SNAPSHOT_FAIL_STREAK` - consecutive snapshot failures before the run is `BLOCKED` (default `5`).
+Тюнинг снапшотов (`src/entry.py`):
+- `AGENT_SNAPSHOT_LOAD_WAIT_MS`
+- `AGENT_SNAPSHOT_MUTATION_WAIT_MS`
+- `AGENT_SNAPSHOT_MUTATION_IDLE_MS`
+- `AGENT_SNAPSHOT_FALLBACK_SETTLE_MS`
 
-Snapshot tuning (optional, `src/entry.py`):
-
-- `AGENT_SNAPSHOT_LOAD_WAIT_MS` - max wait for `load` (default `8000`).
-- `AGENT_SNAPSHOT_MUTATION_WAIT_MS` - SPA idle wait timeout (default `6000`).
-- `AGENT_SNAPSHOT_MUTATION_IDLE_MS` - required quiet period in ms (default `500`).
-- `AGENT_SNAPSHOT_FALLBACK_SETTLE_MS` - short delay when falling back to a degraded snapshot (default `350`).
-
-Recommended baseline:
+Рекомендуемый baseline:
 
 ```env
 AGENT_MAX_TOTAL_STEPS=45
@@ -101,4 +101,5 @@ AGENT_MAX_RESTARTS_PER_SUBTASK=2
 AGENT_LOOP_REPEAT_THRESHOLD=3
 AGENT_LANGGRAPH_RECURSION_LIMIT=200
 AGENT_MAX_SNAPSHOT_FAIL_STREAK=5
+AGENT_MAX_REPLANS=2
 ```

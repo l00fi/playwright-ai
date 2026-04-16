@@ -2,4 +2,7 @@ browser_data
 playwright-ai
 *.png
 .env
-artifacts
+materials
+__pycache__/
+**/__pycache__/
+*.py[cod]

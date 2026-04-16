@@ -1,6 +1,5 @@
-playwright 
-langchain 
+playwright
+langchain
 langchain-openai
-langchain-ollama 
 langgraph
-dotenv
+python-dotenv

@@ -5,6 +5,16 @@ import time
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
+"""
+Playwright browser environment used by the agent runtime.
+
+Responsibilities:
+- keep a single active tab (normalize popups/new tabs),
+- annotate interactable elements with stable temporary IDs,
+- provide screenshot + structured text state for LLM reasoning,
+- execute low-level UI actions by `data-ai-id`.
+"""
+
 
 def _env_int(name: str, default: int, min_value: int = 0) -> int:
     raw = os.getenv(name, "")
@@ -15,6 +25,7 @@ def _env_int(name: str, default: int, min_value: int = 0) -> int:
 
 
 class BrowserEnv:
+    """Stateful browser wrapper with SoM-style visual labeling and parsing."""
     def __init__(self, headless: bool = False, user_data_dir: str = "./browser_data"):
         self.playwright = sync_playwright().start()
         self.context = self.playwright.chromium.launch_persistent_context(
@@ -33,6 +44,7 @@ class BrowserEnv:
         self._ensure_single_tab()
 
     def _on_new_page(self, new_page):
+        """Collapse new tabs into the primary page to keep agent context single-tab."""
         if new_page == self.page:
             return
         try:
@@ -60,6 +72,7 @@ class BrowserEnv:
         self._ensure_single_tab()
 
     def _ensure_single_tab(self):
+        """Guarantee exactly one controlled tab in the persistent context."""
         pages = list(self.context.pages)
         if self.page not in pages and pages:
             self.page = pages[0]
@@ -151,6 +164,7 @@ class BrowserEnv:
         return True, True
 
     def _draw_labels(self) -> int:
+        """Overlay numeric IDs on visible interactable elements and return count."""
         script = """
         () => {
             document.querySelectorAll('.ai-label').forEach(el => el.remove());
@@ -182,7 +196,7 @@ class BrowserEnv:
                     style.opacity !== '0' &&
                     style.pointerEvents !== 'none'
                 ) {
-                    el.style.outline = '1px solid #ff2d2d';
+                    el.style.outline = '0.75px solid #ff2d2d';
                     el.style.outlineOffset = '0px';
                     el.setAttribute('data-ai-highlight', 'true');
                     el.setAttribute('data-ai-id', aiId);
@@ -191,16 +205,16 @@ class BrowserEnv:
                     label.className = 'ai-label';
                     label.innerText = aiId;
                     label.style.position = 'fixed';
-                    label.style.top = Math.max(0, Math.min(viewportH - 18, rect.top)) + 'px';
-                    label.style.left = Math.max(0, Math.min(viewportW - 22, rect.left)) + 'px';
-                    label.style.backgroundColor = 'rgba(255, 0, 0, 0.92)';
+                    label.style.top = Math.max(0, Math.min(viewportH - 15, rect.top)) + 'px';
+                    label.style.left = Math.max(0, Math.min(viewportW - 18, rect.left)) + 'px';
+                    label.style.backgroundColor = 'rgba(220, 0, 0, 0.86)';
                     label.style.color = '#ffffff';
                     label.style.fontWeight = 'bold';
-                    label.style.fontSize = '11px';
-                    label.style.lineHeight = '1.1';
-                    label.style.padding = '0px 3px';
-                    label.style.border = '1px solid white';
-                    label.style.borderRadius = '3px';
+                    label.style.fontSize = '9px';
+                    label.style.lineHeight = '1.0';
+                    label.style.padding = '0px 2px';
+                    label.style.border = '0.75px solid rgba(255,255,255,0.95)';
+                    label.style.borderRadius = '2px';
                     label.style.zIndex = '2147483647';
                     label.style.pointerEvents = 'none';
                     document.body.appendChild(label);
@@ -215,6 +229,7 @@ class BrowserEnv:
         return self.page.evaluate(script)
 
     def parse_page(self) -> str:
+        """Extract structured interactable list + visible textual content for LLM prompts."""
         js_script = """
         () => {
             const interactable = [];
@@ -267,6 +282,12 @@ class BrowserEnv:
         return self.page.evaluate(js_script)
 
     def get_visual_state(self):
+        """
+        Produce model-facing state tuple: `(screenshot_path, text_state)`.
+
+        Includes readiness waits, overlay drawing, metadata persistence, and degraded fallback
+        markers so downstream logic can reason about snapshot quality.
+        """
         ready, degraded = self._wait_until_page_ready_for_screenshot()
         if not ready:
             return None, "Ошибка визуализации: страница не достигла даже базовой готовности (DOM)."
@@ -396,6 +417,10 @@ class BrowserEnv:
         self.page.mouse.click(cx, cy)
 
     def click_element(self, element_id: int):
+        """
+        Click by temporary overlay ID with layered fallbacks:
+        locator click -> force click -> mouse center by bbox -> mouse center by JS rect.
+        """
         self._ensure_single_tab()
         self._clear_floating_labels_only()
         selector = f'[data-ai-id="{element_id}"]'

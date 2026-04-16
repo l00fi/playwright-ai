@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+"""
+Core runtime for the autonomous browser agent.
+
+Design overview:
+- Critic (planner + evaluator) decides *what* should happen next.
+- Executor decides and performs exactly one tool call per step.
+- LangGraph state machine orchestrates retries, loop handling, replans, and finalization.
+
+This module intentionally keeps the state contract explicit (`RuntimeState`) so behavior is
+auditable in logs and easier to reason about during troubleshooting.
+"""
+
 import base64
 import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
@@ -16,6 +27,30 @@ from langgraph.graph import END, StateGraph
 
 from src import prompts
 from src.agent_tools import env, tools
+from src.run_logger import RunLogger
+
+
+def _safe_page_url() -> str:
+    """Best-effort current URL read from Playwright page."""
+    try:
+        return env.page.url
+    except Exception:
+        return ""
+
+
+def _navigation_waypoint_from_state(state: "RuntimeState") -> dict:
+    """Checkpoint after a subtask is marked done: subtask label, URL, visible text excerpt."""
+    idx = int(state.get("current_subtask_idx", 0))
+    plan = state.get("plan") or []
+    subtask = plan[idx] if 0 <= idx < len(plan) else ""
+    raw = state.get("post_text_metadata") or state.get("last_page_text") or ""
+    excerpt = " ".join(str(raw)[:800].split())
+    return {
+        "subtask_idx": idx,
+        "subtask": subtask,
+        "url": _safe_page_url(),
+        "text_excerpt": excerpt[:400],
+    }
 
 load_dotenv()
 
@@ -161,73 +196,9 @@ def _maybe_navigation_done(subtask: str, last_action: ActionRecord, page_text: s
     return None
 
 
-def _evidence_grounds_in_page(evidence: str, page_text: str, last_action: ActionRecord) -> bool:
-    ev = (evidence or "").strip()
-    if len(ev) < 8:
-        return False
-    pl = (page_text or "").lower()
-    el = ev.lower()
-    if el in pl:
-        return True
-    for n in range(0, max(1, len(el) - 24)):
-        chunk = el[n : n + 32]
-        if len(chunk) >= 12 and chunk in pl:
-            return True
-    if last_action.tool == "navigate":
-        try:
-            u = str(last_action.args.get("url", ""))
-            host = _host_key(urlparse(u).netloc)
-            combined = f"{page_text} {last_action.url}".lower()
-            if host and host in combined:
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def _policy_validate_done(
-    page_text: str,
-    last_action: ActionRecord,
-    status: str,
-    reason: str,
-    evidence: str,
-) -> tuple[str, str]:
-    if status != "done":
-        return status, reason
-    pt = (page_text or "").strip()
-    if len(pt) < 25 and "SNAPSHOT_DEGRADED" not in pt:
-        return "progress", "Policy: cannot confirm done — page text too short to verify."
-    if not _evidence_grounds_in_page(evidence, page_text, last_action):
-        return (
-            "progress",
-            "Policy: critic marked done but evidence is not grounded in visible page text.",
-        )
-    return status, reason
-
-
-class RunLogger:
-    def __init__(self):
-        self.run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.run_dir = os.path.join("artifacts", "runs", self.run_id)
-        os.makedirs(self.run_dir, exist_ok=True)
-        self.jsonl_path = os.path.join(self.run_dir, "events.jsonl")
-        self.md_path = os.path.join(self.run_dir, "timeline.md")
-        with open(self.md_path, "w", encoding="utf-8") as f:
-            f.write(f"# Run timeline {self.run_id}\n\n")
-
-    def log(self, event_type: str, **payload):
-        event = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event_type, **payload}
-        with open(self.jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
-        summary = payload.get("summary", "") or ", ".join(
-            f"{k}={v}" for k, v in payload.items() if k not in {"raw", "result", "text_state"}
-        )
-        with open(self.md_path, "a", encoding="utf-8") as f:
-            f.write(f"- `{event['ts']}` **{event_type}**: {summary}\n")
-
-
 @dataclass
 class ActionRecord:
+    """Single executor action persisted in runtime state and logs."""
     subtask_idx: int
     step: int
     tool: str
@@ -239,12 +210,33 @@ class ActionRecord:
 
 
 class Critic:
+    """LLM-backed planner/evaluator with strict JSON IO contract."""
     def __init__(self, llm: ChatOpenAI):
         self.llm = llm
 
-    def _invoke_json(self, system_text: str, user_text: str, max_attempts: int = 3):
+    def _invoke_json(
+        self,
+        system_text: str,
+        user_text: str,
+        max_attempts: int = 3,
+        screenshot_path: str = "",
+    ):
         full_system_text = f"{prompts.CRITIC_JSON_SYSTEM_PROMPT}\n\n{system_text}"
-        base = [SystemMessage(content=full_system_text), HumanMessage(content=user_text)]
+        if screenshot_path:
+            try:
+                with open(screenshot_path, "rb") as image_file:
+                    base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+                human = HumanMessage(
+                    content=[
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+                    ]
+                )
+            except Exception:
+                human = HumanMessage(content=user_text)
+        else:
+            human = HumanMessage(content=user_text)
+        base = [SystemMessage(content=full_system_text), human]
         response = _llm_invoke(self.llm, base)
         for _ in range(max_attempts):
             raw = str(response.content or "")
@@ -265,6 +257,39 @@ class Critic:
                 return cleaned[:8]
         return list(prompts.GENERIC_FALLBACK_PLAN)
 
+    def replan(
+        self,
+        goal: str,
+        old_plan: list[str],
+        stuck_subtask_idx: int,
+        completed_count: int,
+        trigger_reason: str,
+        action_log: list[ActionRecord],
+    ) -> list[str]:
+        tail = "\n".join(
+            f"- [{a.subtask_idx + 1}.{a.step}] {a.tool} {a.args} -> {(a.result or '')[:180]}"
+            for a in action_log[-16:]
+        ) or "- none"
+        old_plan_json = json.dumps(old_plan, ensure_ascii=False)
+        user = prompts.REPLAN_USER_PROMPT_TEMPLATE.format(
+            goal=goal,
+            old_plan_json=old_plan_json,
+            completed_count=completed_count,
+            old_plan_len=len(old_plan),
+            stuck_idx=stuck_subtask_idx + 1,
+            trigger_reason=trigger_reason[:1200],
+            recent_actions=tail,
+        )
+        parsed, _ = self._invoke_json(
+            system_text=prompts.REPLAN_SYSTEM_PROMPT,
+            user_text=user,
+        )
+        if isinstance(parsed, list):
+            cleaned = [str(x).strip() for x in parsed if str(x).strip()]
+            if cleaned:
+                return cleaned[:10]
+        return list(prompts.GENERIC_FALLBACK_PLAN)
+
     def detect_loop(self, local_signatures: list[str], repeat_threshold: int) -> str | None:
         if len(local_signatures) < repeat_threshold:
             return None
@@ -280,6 +305,7 @@ class Critic:
         last_action: ActionRecord,
         page_text: str,
         recent_actions: list[ActionRecord],
+        screenshot_path: str = "",
     ) -> dict[str, Any]:
         if not last_action.success:
             return {"status": "stuck", "reason": "Last action failed."}
@@ -297,7 +323,11 @@ class Critic:
             recent_summary=recent_summary,
             page_text=page_text[:2500],
         )
-        parsed, raw = self._invoke_json(system_text=prompts.CRITIC_EVAL_SYSTEM_PROMPT, user_text=prompt)
+        parsed, raw = self._invoke_json(
+            system_text=prompts.CRITIC_EVAL_SYSTEM_PROMPT,
+            user_text=prompt,
+            screenshot_path=screenshot_path,
+        )
         if isinstance(parsed, dict) and parsed.get("status") in {"done", "progress", "stuck", "offtrack"}:
             status = str(parsed.get("status"))
             reason = str(parsed.get("reason", ""))
@@ -308,9 +338,6 @@ class Critic:
             if status == "done" and not scope_ok:
                 status = "progress"
                 reason = f"Scope mismatch for current subtask. {reason}".strip()
-
-            if status == "done":
-                status, reason = _policy_validate_done(page_text, last_action, status, reason, evidence)
 
             if evidence:
                 reason = f"{reason} | evidence: {evidence}".strip()
@@ -341,6 +368,7 @@ class Critic:
         action_log: list[ActionRecord],
         blocked_reason: str = "",
         extracted_answer: str = "",
+        replan_count: int = 0,
     ) -> str:
         status = "SUCCESS" if completed_count == len(plan) and not blocked_reason else "BLOCKED"
         actions_tail = "\n".join(
@@ -351,6 +379,7 @@ class Critic:
             f"status={status}\n"
             f"goal={goal}\n"
             f"completed_subtasks={completed_count}/{len(plan)}\n"
+            f"replan_count={replan_count}\n"
             f"plan:\n{done_list}\n"
             f"recent_actions:\n{actions_tail}"
         )
@@ -368,6 +397,7 @@ class Critic:
 
 
 class Executor:
+    """LLM-backed actor that selects one browser tool call per step."""
     def __init__(self, llm: ChatOpenAI):
         self.llm_with_tools = llm.bind_tools([t for t in tools if t.name != "finish_task"])
 
@@ -379,6 +409,7 @@ class Executor:
         screenshot_path: str,
         recent_actions: list[ActionRecord],
         critic_hint: str = "",
+        navigation_trace: list[dict] | None = None,
     ):
         with open(screenshot_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode("utf-8")
@@ -388,6 +419,7 @@ class Executor:
             goal=goal,
             subtask=subtask,
             critic_hint=(critic_hint or "none"),
+            navigation_trace=prompts.format_navigation_trace(navigation_trace or []),
             recent_actions=recent,
             text_state=text_metadata[:4000],
         )
@@ -427,12 +459,14 @@ def _build_llm() -> ChatOpenAI:
 
 
 class RuntimeState(TypedDict):
+    """LangGraph state contract for one full user run."""
     goal: str
     plan: list[str]
     current_subtask_idx: int
     completed_count: int
     local_steps: int
     restarts: int
+    replan_count: int
     critic_hint: str
     total_steps: int
     blocked_reason: str
@@ -440,8 +474,11 @@ class RuntimeState(TypedDict):
     action_log: list[dict]
     local_action_signatures: list[str]
     recent_subtask_actions: list[dict]
+    # Checkpoints after each completed subtask: subtask_idx, subtask, url, text_excerpt.
+    navigation_trace: list[dict]
     text_metadata: str
     screenshot_path: str
+    post_screenshot_path: str
     post_text_metadata: str
     pending_tool_call: dict
     last_action: dict
@@ -451,11 +488,20 @@ class RuntimeState(TypedDict):
 
 
 def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger):
+    """
+    Build compiled LangGraph app for a single-agent run.
+
+    Nodes are intentionally small and side-effect oriented:
+    - guard/snapshot handle safety and observability boundaries,
+    - executor_* handles action selection + execution,
+    - critic_* handles progress control and transitions.
+    """
     max_total_steps = _env_int("AGENT_MAX_TOTAL_STEPS", 60, min_value=10)
     max_steps_per_subtask = _env_int("AGENT_MAX_STEPS_PER_SUBTASK", 10, min_value=2)
     max_restarts_per_subtask = _env_int("AGENT_MAX_RESTARTS_PER_SUBTASK", 2, min_value=0)
     loop_repeat_threshold = _env_int("AGENT_LOOP_REPEAT_THRESHOLD", 3, min_value=2)
     max_snapshot_fail_streak = _env_int("AGENT_MAX_SNAPSHOT_FAIL_STREAK", 5, min_value=1)
+    max_replan_attempts = _env_int("AGENT_MAX_REPLANS", 2, min_value=0)
 
     def _action_from_dict(data: dict) -> ActionRecord:
         return ActionRecord(**data)
@@ -482,9 +528,11 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             "action_log": [],
             "local_action_signatures": [],
             "recent_subtask_actions": [],
+            "navigation_trace": [],
             "final_report": "",
             "snapshot_fail_streak": 0,
             "last_page_text": "",
+            "replan_count": 0,
         }
 
     def subtask_setup_node(state: RuntimeState):
@@ -509,6 +557,14 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             restarts = state["restarts"] + 1
             if restarts > max_restarts_per_subtask:
                 reason = f"Subtask {state['current_subtask_idx'] + 1} exceeded restart limit ({max_restarts_per_subtask})."
+                if int(state.get("replan_count", 0)) < max_replan_attempts:
+                    run_logger.log(
+                        "replan_trigger",
+                        source="guard_step_limit",
+                        reason=reason,
+                        summary="Replanning instead of block (step limit).",
+                    )
+                    return {"status": "REPLAN", "blocked_reason": reason}
                 run_logger.log("critic_action_block", reason=reason, summary=reason)
                 return {"status": "BLOCKED", "blocked_reason": reason}
             run_logger.log(
@@ -550,7 +606,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
                     "snapshot_fail_streak": streak,
                 }
             return {"status": "SNAPSHOT_FAILED", "text_metadata": text, "snapshot_fail_streak": streak}
-        return {"screenshot_path": shot, "text_metadata": text, "snapshot_fail_streak": 0}
+        return {"screenshot_path": shot, "post_screenshot_path": shot, "text_metadata": text, "snapshot_fail_streak": 0}
 
     def executor_decide_node(state: RuntimeState):
         idx = state["current_subtask_idx"]
@@ -563,6 +619,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             screenshot_path=state["screenshot_path"],
             recent_actions=recent,
             critic_hint=state.get("critic_hint", ""),
+            navigation_trace=list(state.get("navigation_trace") or []),
         )
         reasoning = str(getattr(response, "content", "") or "").strip()
         if reasoning:
@@ -647,6 +704,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             "local_action_signatures": signatures,
             "local_steps": local_step,
             "total_steps": state["total_steps"] + 1,
+            "post_screenshot_path": post_shot or state.get("screenshot_path", ""),
             "post_text_metadata": post_text,
             "last_page_text": post_text[:8000] if isinstance(post_text, str) else "",
         }
@@ -663,6 +721,14 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
                     f"Subtask {state['current_subtask_idx'] + 1} looped ({loop_sig}) "
                     f"and exceeded restart limit."
                 )
+                if int(state.get("replan_count", 0)) < max_replan_attempts:
+                    run_logger.log(
+                        "replan_trigger",
+                        source="critic_loop",
+                        reason=reason,
+                        summary="Replanning instead of block (loop).",
+                    )
+                    return {"status": "REPLAN", "blocked_reason": reason}
                 run_logger.log("critic_action_block", reason=reason, summary=reason)
                 return {"status": "BLOCKED", "blocked_reason": reason}
             run_logger.log(
@@ -690,6 +756,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             last_action=last_action,
             page_text=state.get("post_text_metadata", ""),
             recent_actions=recent_actions,
+            screenshot_path=(state.get("post_screenshot_path") or state.get("screenshot_path") or ""),
         )
         status = check.get("status", "progress")
         reason = str(check.get("reason", ""))
@@ -706,6 +773,18 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
         if status == "done":
             next_idx = state["current_subtask_idx"] + 1
             completed = state["completed_count"] + 1
+            wp = _navigation_waypoint_from_state(state)
+            trace = list(state.get("navigation_trace") or [])
+            trace.append(wp)
+            max_tr = prompts.NAVIGATION_TRACE_MAX_ITEMS
+            if len(trace) > max_tr:
+                trace = trace[-max_tr:]
+            run_logger.log(
+                "navigation_waypoint",
+                waypoint=wp,
+                trace_len=len(trace),
+                summary=f"Checkpoint after subtask {state['current_subtask_idx'] + 1}: {str(wp.get('url', ''))[:140]}",
+            )
             run_logger.log(
                 "subtask_completed",
                 subtask_idx=state["current_subtask_idx"],
@@ -714,7 +793,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             )
             print(f"✅ [Critic] subtask {state['current_subtask_idx'] + 1} completed")
             if next_idx >= len(state["plan"]):
-                return {"status": "SUCCESS", "completed_count": completed}
+                return {"status": "SUCCESS", "completed_count": completed, "navigation_trace": trace}
             return {
                 "status": "NEXT_SUBTASK",
                 "completed_count": completed,
@@ -724,6 +803,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
                 "critic_hint": "",
                 "local_action_signatures": [],
                 "recent_subtask_actions": [],
+                "navigation_trace": trace,
             }
 
         if status in {"stuck", "offtrack"}:
@@ -733,6 +813,14 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
                     f"Critic stopped on subtask {state['current_subtask_idx'] + 1}: {reason}. "
                     "Restart limit exceeded."
                 )
+                if int(state.get("replan_count", 0)) < max_replan_attempts:
+                    run_logger.log(
+                        "replan_trigger",
+                        source="critic_stuck",
+                        reason=reason_block,
+                        summary="Replanning instead of block (stuck/offtrack).",
+                    )
+                    return {"status": "REPLAN", "blocked_reason": reason_block}
                 run_logger.log("critic_action_block", reason=reason_block, summary=reason_block)
                 return {"status": "BLOCKED", "blocked_reason": reason_block}
             run_logger.log(
@@ -768,8 +856,10 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             action_log=action_log,
             blocked_reason=state.get("blocked_reason", ""),
             extracted_answer=extracted,
+            replan_count=int(state.get("replan_count", 0)),
         )
         blocked = state.get("status") == "BLOCKED"
+        runtime_stats = run_logger.runtime_stats()
         run_logger.log(
             "run_finished",
             completed_subtasks=state["completed_count"],
@@ -778,22 +868,72 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
             report=report,
             answer_extracted=bool((extracted or "").strip()),
             partial_text_answer=bool(blocked and (extracted or "").strip()),
+            navigation_trace=state.get("navigation_trace") or [],
+            elapsed_seconds=runtime_stats["elapsed_seconds"],
+            tool_call_counts=runtime_stats["tool_call_counts"],
+            agent_route=runtime_stats["agent_route"],
             summary=(
                 f"Run finished: {state['completed_count']}/{len(state['plan'])}, blocked={blocked}; "
-                f"best_effort_answer={'yes' if blocked and (extracted or '').strip() else 'no'}"
+                f"best_effort_answer={'yes' if blocked and (extracted or '').strip() else 'no'}; "
+                f"elapsed={runtime_stats['elapsed_seconds']}s; tools={runtime_stats['tool_call_counts']}"
             ),
         )
         return {"final_report": report}
 
+    def replan_node(state: RuntimeState):
+        old_plan = list(state.get("plan") or [])
+        goal = (state.get("goal") or "").strip()
+        idx = int(state.get("current_subtask_idx", 0))
+        comp = int(state.get("completed_count", 0))
+        trigger = (state.get("blocked_reason") or "subtask retries exhausted").strip()
+        action_log = [_action_from_dict(a) for a in state.get("action_log", [])]
+        new_plan = critic.replan(goal, old_plan, idx, comp, trigger, action_log)
+        rc = int(state.get("replan_count", 0)) + 1
+        run_logger.log(
+            "plan_replanned",
+            replan_no=rc,
+            trigger=trigger[:400],
+            new_subtasks=new_plan,
+            summary=f"Replanned (#{rc}): {len(new_plan)} subtasks.",
+        )
+        print(f"\n🔁 [Critic] NEW PLAN (replan #{rc}, trigger: {trigger[:120]}…):")
+        for i, t in enumerate(new_plan, start=1):
+            print(f"  {i}. {t}")
+        if new_plan:
+            run_logger.log(
+                "subtask_started",
+                subtask_idx=0,
+                subtask=new_plan[0],
+                summary=f"After replan — start subtask 1: {new_plan[0][:120]}",
+            )
+        return {
+            "plan": new_plan,
+            "current_subtask_idx": 0,
+            "completed_count": 0,
+            "local_steps": 0,
+            "restarts": 0,
+            "replan_count": rc,
+            "status": "RUNNING",
+            "blocked_reason": "",
+            "critic_hint": "The previous plan was replaced — execute the new subtask list from the top.",
+            "local_action_signatures": [],
+            "recent_subtask_actions": [],
+            "navigation_trace": [],
+        }
+
     def route_after_guard(state: RuntimeState):
+        """Route after guard checks: continue, replan, or finalize."""
         status = state.get("status", "RUNNING")
         if status in {"SUCCESS", "BLOCKED"}:
             return "finalize"
+        if status == "REPLAN":
+            return "replan"
         if status == "RESTART_SUBTASK":
             return "guard"
         return "snapshot"
 
     def route_after_snapshot(state: RuntimeState):
+        """Route after snapshot capture result."""
         if state.get("status") == "BLOCKED":
             return "finalize"
         if state.get("status") == "SNAPSHOT_FAILED":
@@ -801,21 +941,26 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
         return "executor_decide"
 
     def route_after_decide(state: RuntimeState):
+        """Route after executor decision validity check."""
         if state.get("status") == "DECIDE_FAILED":
             return "guard"
         return "executor_execute"
 
     def route_after_critic(state: RuntimeState):
+        """Route based on critic verdict for current subtask."""
         status = state.get("status", "RUNNING")
         if status in {"SUCCESS", "BLOCKED"}:
             return "finalize"
         if status == "NEXT_SUBTASK":
             return "subtask_setup"
+        if status == "REPLAN":
+            return "replan"
         return "guard"
 
     graph = StateGraph(RuntimeState)
     graph.add_node("init", init_node)
     graph.add_node("subtask_setup", subtask_setup_node)
+    graph.add_node("replan", replan_node)
     graph.add_node("guard", guard_node)
     graph.add_node("snapshot", snapshot_node)
     graph.add_node("executor_decide", executor_decide_node)
@@ -826,7 +971,12 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
     graph.set_entry_point("init")
     graph.add_edge("init", "subtask_setup")
     graph.add_edge("subtask_setup", "guard")
-    graph.add_conditional_edges("guard", route_after_guard, {"snapshot": "snapshot", "guard": "guard", "finalize": "finalize"})
+    graph.add_edge("replan", "guard")
+    graph.add_conditional_edges(
+        "guard",
+        route_after_guard,
+        {"snapshot": "snapshot", "guard": "guard", "finalize": "finalize", "replan": "replan"},
+    )
     graph.add_conditional_edges(
         "snapshot",
         route_after_snapshot,
@@ -837,7 +987,7 @@ def build_runtime_app(critic: Critic, executor: Executor, run_logger: RunLogger)
     graph.add_conditional_edges(
         "critic_evaluate",
         route_after_critic,
-        {"guard": "guard", "subtask_setup": "subtask_setup", "finalize": "finalize"},
+        {"guard": "guard", "subtask_setup": "subtask_setup", "finalize": "finalize", "replan": "replan"},
     )
     graph.add_edge("finalize", END)
     return graph.compile()
@@ -876,14 +1026,17 @@ def run_app():
         "action_log": [],
         "local_action_signatures": [],
         "recent_subtask_actions": [],
+        "navigation_trace": [],
         "text_metadata": "",
         "screenshot_path": "",
+        "post_screenshot_path": "",
         "post_text_metadata": "",
         "pending_tool_call": {},
         "last_action": {},
         "final_report": "",
         "snapshot_fail_streak": 0,
         "last_page_text": "",
+        "replan_count": 0,
     }
 
     recursion_limit = _env_int("AGENT_LANGGRAPH_RECURSION_LIMIT", 200, min_value=30)

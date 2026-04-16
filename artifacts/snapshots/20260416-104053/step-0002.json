@@ -1,0 +1,19 @@
+{
+  "snapshot_step": 2,
+  "timestamp": "2026-04-16T10:41:34",
+  "run_id": "20260416-104053",
+  "screenshot_path_runtime": "screenshot.png",
+  "screenshot_path_saved": "artifacts\\snapshots\\20260416-104053\\step-0002.png",
+  "labels_count": 65,
+  "current_url": "https://mail.google.com/mail/u/0/#inbox",
+  "current_title": "Входящие (2 184) - yura.kabantsov@gmail.com - Gmail",
+  "open_tabs_count": 1,
+  "open_tabs": [
+    {
+      "idx": 0,
+      "url": "https://mail.google.com/mail/u/0/#inbox"
+    }
+  ],
+  "recent_tab_redirect_events": [],
+  "text_state": "INTERACTIVE ELEMENTS:\n[ID: 1] div - 'Главное меню'\n[ID: 2] a - 'Почта'\n[ID: 3] input - 'Поиск в почте'\n[ID: 4] button - 'Расширенный поиск'\n[ID: 5] button - 'Поиск в почте'\n[ID: 6] a - 'Поддержка'\n[ID: 7] a - 'Настройки'\n[ID: 8] a - 'Приложения Google'\n[ID: 9] a - 'Аккаунт Google: Юрий Кабанцов   (yura.kabantsov@gmail.com)'\n[ID: 10] div - 'Написать'\n[ID: 11] a - 'Входящие'\n[ID: 12] a - 'Помеченные'\n[ID: 13] a - 'Отложенные'\n[ID: 14] a - 'Отправленные'\n[ID: 15] a - 'Черновики'\n[ID: 16] a - 'Покупки'\n[ID: 17] span - 'Ещё'\n[ID: 18] div - 'Создать ярлык'\n[ID: 19] a - 'Билеты и чеки'\n[ID: 20] a - 'Развлекуха'\n[ID: 21] button - 'Сменить план'\n[ID: 22] div - 'No text'\n[ID: 23] div - 'Обновить'\n[ID: 24] div - 'Другие действия с письмом'\n[ID: 25] div - '1–50 из 2 667'\n[ID: 26] div - 'Пред.'\n[ID: 27] div - 'След.'\n[ID: 28] a - 'Включить/отключить способы ввода (Ctrl + Shift + K)'\n[ID: 29] a - 'Выбрать языки'\n[ID: 30] div - 'Несортированные'\n[ID: 31] div - 'Промоакции'\n[ID: 32] div - 'Соцсети'\n[ID: 33] div - 'Оповещения'\n[ID: 34] span - 'Не помечено'\n[ID: 35] div - 'Ваш заказ 24/7 | АВТО | OpenRouter | Пополнение Баланса | Без Входа | API-Ключ |'\n[ID: 36] span - 'Не помечено'\n[ID: 37] div - 'Digiseller: продавец написал сообщение  -  Уважаемый покупатель! Продавец товара'\n[ID: 38] span - 'Не помечено'\n[ID: 39] div - 'Unrecognized device signed in to your OpenRouter account  -  New sign in to your'\n[ID: 40] span - 'Не помечено'\n[ID: 41] div - 'Ваша покупка на площадке Plati  -  logo Уважаемый покупатель! На торговой площад'\n[ID: 42] span - 'Не помечено'\n[ID: 43] div - 'Oplata.Info: личный кабинет покупателя  -  Уважаемый покупатель! Для доступа к в'\n[ID: 44] span - 'Не помечено'\n[ID: 45] div - 'Pally: Произведена оплата.  -  pally Pally: Произведена оплата. Здравствуйте, Вы'\n[ID: 46] span - 'Не помечено'\n[ID: 47] div - 'Вам написали по вакансии ML Инженер  -  Сообщение в письме ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌'\n[ID: 48] span - 'Не помечено'\n[ID: 49] div - 'Новое сообщение от пользователя Audin  -  Новое сообщение от пользователя Audin '\n[ID: 50] span - 'Не помечено'\n[ID: 51] div - 'Ваш заказ 24/7 | АВТО | OpenRouter | Пополнение Баланса | Без Входа | API-Ключ |'\n[ID: 52] span - 'Не помечено'\n[ID: 53] div - 'Welcome to OpenRouter  -  OpenRouter OpenRouter Hi Юрий, Welcome to OpenRouter. '\n[ID: 54] span - 'Не помечено'\n[ID: 55] div - 'Ваша кандидатура на вакансию отклонена  -  поддержка Здравствуйте! Спасибо за ин'\n[ID: 56] span - 'Не помечено'\n[ID: 57] div - 'Сброс пароля  -  Эта ссылка действительна в течение 15 минут. Если вы не запраши'\n[ID: 58] span - 'Не помечено'\n[ID: 59] div - 'Регистрация или вход на Playerok  -  042028 – ваш код подтверждения на Playerok '\n[ID: 60] span - 'Не помечено'\n[ID: 61] div - 'Регистрация в Cursor  -  Ваш одноразовый код: 260520. Код действителен в течение'\n[ID: 62] span - 'Не помечено'\n[ID: 63] div - '[GitHub] Sudo email verification code  -  Please verify your identity, l00fi Her'\n[ID: 64] span - 'Не помечено'\n[ID: 65] div - 'Участвуйте в чемпионате ArtMasters  -  Для специалистов сферы креативных индустр'\n\nVISIBLE PAGE TEXT:\nNo substantial visible text extracted."
+}
